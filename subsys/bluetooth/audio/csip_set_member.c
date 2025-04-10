@@ -38,6 +38,7 @@
 #include <zephyr/sys/check.h>
 
 #include "../host/conn_internal.h"
+#include "../host/hci_core.h"
 #include "../host/keys.h"
 
 #include "common/bt_str.h"
@@ -83,6 +84,7 @@ struct bt_csip_set_member_svc_inst {
 static struct bt_csip_set_member_svc_inst svc_insts[CONFIG_BT_CSIP_SET_MEMBER_MAX_INSTANCE_COUNT];
 
 static void deferred_nfy_work_handler(struct k_work *work);
+static void add_bonded_addr_to_client_list(const struct bt_bond_info *info, void *data);
 
 static K_WORK_DELAYABLE_DEFINE(deferred_nfy_work, deferred_nfy_work_handler);
 
@@ -460,9 +462,13 @@ static void set_lock_timer_handler(struct k_work *work)
 static void csip_security_changed(struct bt_conn *conn, bt_security_t level,
 				  enum bt_security_err err)
 {
+	const bt_addr_le_t *peer_addr;
+
 	if (err != 0 || conn->encrypt == 0) {
 		return;
 	}
+
+	peer_addr = bt_conn_get_dst(conn);
 
 	if (!bt_le_bond_exists(conn->id, &conn->le.dst)) {
 		return;
@@ -471,13 +477,34 @@ static void csip_security_changed(struct bt_conn *conn, bt_security_t level,
 	for (size_t i = 0U; i < ARRAY_SIZE(svc_insts); i++) {
 		struct bt_csip_set_member_svc_inst *svc_inst = &svc_insts[i];
 
-		for (size_t j = 0U; j < ARRAY_SIZE(svc_inst->clients); j++) {
-			struct csip_client *client;
+		bool found = false;
 
-			client = &svc_inst->clients[i];
+		/* Check if client is already in the active list */
+		for (size_t j = 0U; j < ARRAY_SIZE(svc_inst->clients); j++) {
+			struct csip_client *client = &svc_inst->clients[j];
+
+			if (atomic_test_bit(client->flags, FLAG_ACTIVE) &&
+			    bt_addr_le_eq(peer_addr, &client->addr)) {
+				found = true;
+				break;
+			}
+		}
+
+		/* If not found, add the bonded address to the client list */
+		if (!found) {
+			const struct bt_bond_info bond_info = {
+				.addr = *peer_addr
+			};
+
+			add_bonded_addr_to_client_list(&bond_info, NULL);
+		}
+
+		/* Check for clients with FLAG_NOTIFY_LOCK */
+		for (size_t j = 0U; j < ARRAY_SIZE(svc_inst->clients); j++) {
+			struct csip_client *client = &svc_inst->clients[j];
 
 			if (atomic_test_bit(client->flags, FLAG_NOTIFY_LOCK) &&
-			    bt_addr_le_eq(bt_conn_get_dst(conn), &client->addr)) {
+			    bt_addr_le_eq(peer_addr, &client->addr)) {
 				notify_work_reschedule(K_NO_WAIT);
 				break;
 			}
@@ -737,11 +764,26 @@ static void notify(struct bt_csip_set_member_svc_inst *svc_inst, struct bt_conn 
 {
 	int err;
 
-	if (svc_inst->service_p == NULL) {
+	if (svc_inst->service_p == NULL || svc_inst->service_p->attrs == NULL) {
 		return;
 	}
 
-	err = bt_gatt_notify_uuid(conn, uuid, svc_inst->service_p->attrs, data, len);
+	const struct bt_gatt_attr *attr = bt_gatt_find_by_uuid(
+		svc_inst->service_p->attrs,
+		svc_inst->service_p->attr_count,
+		uuid);
+
+	if (!attr) {
+		LOG_WRN("Attribute for UUID %p not found", uuid);
+		return;
+	}
+
+	if (!bt_gatt_is_subscribed(conn, attr, BT_GATT_CCC_NOTIFY)) {
+		LOG_DBG("Connection not subscribed to UUID %p", uuid);
+		return;
+	}
+
+	err = bt_gatt_notify(conn, attr, data, len);
 	if (err) {
 		if (err == -ENOTCONN) {
 			LOG_DBG("Notification error: ENOTCONN (%d)", err);
@@ -801,7 +843,7 @@ static void add_bonded_addr_to_client_list(const struct bt_bond_info *info, void
 	for (size_t i = 0U; i < ARRAY_SIZE(svc_insts); i++) {
 		struct bt_csip_set_member_svc_inst *svc_inst = &svc_insts[i];
 
-		for (size_t j = 1U; j < ARRAY_SIZE(svc_inst->clients); i++) {
+		for (size_t j = 0U; j < ARRAY_SIZE(svc_inst->clients); j++) {
 			/* Check if device is registered, it not, add it */
 			if (!atomic_test_bit(svc_inst->clients[j].flags, FLAG_ACTIVE)) {
 				char addr_str[BT_ADDR_LE_STR_LEN];
@@ -849,8 +891,10 @@ int bt_csip_set_member_register(const struct bt_csip_set_member_register_param *
 		bt_conn_cb_register(&conn_callbacks);
 		bt_conn_auth_info_cb_register(&auth_callbacks);
 
-		/* Restore bonding list */
-		bt_foreach_bond(BT_ID_DEFAULT, add_bonded_addr_to_client_list, NULL);
+		if (atomic_test_bit(bt_dev.flags, BT_DEV_ENABLE)) {
+			/* Restore bonding list */
+			bt_foreach_bond(BT_ID_DEFAULT, add_bonded_addr_to_client_list, NULL);
+		}
 
 		first_register = true;
 	}
